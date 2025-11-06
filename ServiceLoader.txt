@@ -1,0 +1,256 @@
+# ServiceLoader / SPI 
+
+## 0. 什么是 SPI / ServiceLoader
+
+- **SPI（Service Provider Interface）**：一套“接口 + 约定式注册”的插件发现机制。
+- **ServiceLoader**：JDK 提供的默认 SPI 发现/加载器，实现**按需（惰性）发现、按需实例化**。
+
+常见使用：
+
+- JDBC 4+ 驱动自动发现（`java.sql.Driver`）
+- 脚本引擎（`ScriptEngineFactory`）
+- JSON/XML/日志等可插拔实现
+
+------
+
+## 1. 文件结构与注册约定
+
+### 1.1 配置文件位置
+
+```bash
+META-INF/services/<服务接口的全限定名>
+```
+
+例如：
+
+```bash
+META-INF/services/javax.script.ScriptEngineFactory
+```
+
+### 1.2 配置文件内容规范
+
+- 一行一个**实现类的全限定名**
+- 允许空行、允许 `#` 开头注释
+- 不允许非法字符（只能是合法标识符 + `.`）
+- **顺序有意义**（被发现的顺序就是迭代顺序）
+- 同一 provider 重复条目会被去重（后续解析时忽略已加载过的）
+
+示例：
+
+```bash
+# JavaScript engine
+com.example.MyNashornEngineFactory
+com.example.MyGraalEngineFactory
+```
+
+------
+
+## 2. API 速查
+
+### 2.1 常用静态工厂
+
+```bash
+ServiceLoader<T> load(Class<T> service)             // 用 TCCL（线程上下文类加载器）
+ServiceLoader<T> load(Class<T> service, ClassLoader cl)
+ServiceLoader<T> loadInstalled()                    // “已安装”的 provider（系统类路径）
+```
+
+> 重点：`load(service)` 默认使用 **TCCL**；如果传 `null`，构造器里会退回到 `SystemClassLoader`。
+
+### 2.2 遍历与实例化
+
+```bash
+ServiceLoader<MyService> sl = ServiceLoader.load(MyService.class);
+for (MyService s : sl) {      // 迭代时才实例化
+    s.doWork();
+}
+```
+
+### 2.3 Java 9+：按需获取 Provider
+
+```bash
+for (ServiceLoader.Provider<MyService> p : sl.stream().toList()) {
+    Class<? extends MyService> clazz = p.type(); // 只取类型，不实例化
+    MyService s = p.get();                       // 需要时再实例化
+}
+```
+
+> 优势：可先筛选/比对元信息，**避免盲目实例化**（更安全可控）。
+
+### 2.4 重新扫描
+
+```bash
+sl.reload(); // 清空已知实例缓存，重新扫描类路径
+```
+
+## 3. 内部原理（源码视角）
+
+### 3.1 惰性解析的“二阶段”
+
+- **阶段 A（发现）**：`iterator.hasNext()` → `LazyIterator.hasNextService()`
+  - 首次调用时，`ClassLoader.getResources("META-INF/services/<接口>")` 收集所有配置文件 URL（可能有多个 jar）
+  - 逐个 `parse(url)` 解析，一次返回一个**类名字符串**，缓存到 `nextName`
+- **阶段 B（实例化）**：`iterator.next()` → `LazyIterator.nextService()`
+  - 取出 `nextName` → `Class.forName(cn, false, loader)` 加载类
+  - `service.isAssignableFrom(c)` 校验类型
+  - `c.newInstance()` 反射构造无参实例
+  - 放入 `providers` 缓存（`LinkedHashMap<String,S>`，保持顺序、去重）
+
+> 关键缓存变量：`nextName`（上一步发现的下一个类名，等下一步消费）
+
+### 3.2 资源查找
+
+- `ClassLoader.getResources(fullName)` → 返回 **`Enumeration<URL>`**（可能来自多个 jar 包）
+- 对每个 `URL.openStream()` → `InputStreamReader(UTF-8)` → `BufferedReader.readLine()` 逐行解析
+
+### 3.3 安全域处理
+
+- `AccessController.doPrivileged(...)` 包裹 I/O 与类加载
+   目的：在存在 `SecurityManager` 时，以框架自身权限执行资源访问（不受调用者权限限制）
+
+------
+
+## 4. 默认类加载器策略
+
+| API                               | 使用的类加载器                      |
+| --------------------------------- | ----------------------------------- |
+| `ServiceLoader.load(service)`     | **线程上下文类加载器（TCCL）**      |
+| `ServiceLoader.load(service, cl)` | 显式传入的 `cl`                     |
+| `new ServiceLoader<>(..., null)`  | 构造器里回退到 `SystemClassLoader`  |
+| `loadInstalled()`                 | 基于系统类路径（“已安装” provider） |
+
+## 5. 与 Class.forName 的对比
+
+| 维度       | ServiceLoader                 | 直接 `Class.forName`                    |
+| ---------- | ----------------------------- | --------------------------------------- |
+| 目标       | 扫描并发现“未知/可插拔”的实现 | 已知具体类名的反射加载                  |
+| 配置来源   | `META-INF/services/*`         | 业务代码（或外部配置直接给类名）        |
+| 实例化时机 | 惰性（迭代时）                | 立即                                    |
+| 可维护性   | 高（新增实现无需改代码）      | 低（每加一个实现都要改代码或配置）      |
+| 安全面     | **类路径投毒**/TCCL 劫持风险  | **类名可控**风险（远程类加载/反射 RCE） |
+
+## 6. 审计与安全要点
+
+1. **类路径控制**
+   - 尽量固定 classpath / modulepath，避免用户可写目录混入
+   - 生产环境禁用/限制**远程 URLClassLoader**（现代 JDK 默认不会加载 http 远端）
+2. **类加载器使用**
+   - 不要让外部输入影响 TCCL
+   - 关键框架最好用**显式受控的 ClassLoader** 来 `load(service, cl)`
+3. **白名单策略**
+   - 使用 `ServiceLoader.stream()` 只读类型，先比对白名单，再 `get()` 实例化
+   - 或者对 provider 进行**签名校验** / **包名限制**
+4. **最小化权限**
+   - 限制能读 `META-INF/services` 的 ClassLoader 来源
+   - 在有 `SecurityManager`（老系统）时配置合适的策略（现在多数场景是容器/容器化隔离）
+5. **常见误用**
+   - 盲目 `for (T t : loader)` 导致**每个 provider 都被实例化**（可能有副作用）
+   - 打包或 shading 后，**多个 JAR 的服务文件被覆盖/丢失**（排查 `META-INF/services` 是否被合并）
+
+------
+
+## 7. 典型案例梳理
+
+### 7.1 JDBC 驱动发现（JDK 6+）
+
+- 驱动 jar 内的：
+
+```bash
+META-INF/services/java.sql.Driver
+-> org.postgresql.Driver
+```
+
+- `DriverManager` 内部会通过 `ServiceLoader<Driver>` 发现并注册驱动；所以**不再需要**手动 `Class.forName("org.postgresql.Driver")`
+
+### 7.2 ScriptEngineManager
+
+- `ServiceLoader<ScriptEngineFactory>` 发现所有脚本引擎（Nashorn、Graal、Rhino…）
+- `ScriptEngineManager.getEngineByName("javascript")` 会在已加载的 factory 中挑满足条件的返回
+
+------
+
+## 8. 开发与调试 Tips
+
+1. **单元测试**
+   - 测试用实现类放在 `test/resources/META-INF/services/...`
+   - 注意测试类加载器是否能看到它（IDEA/构建工具资源目录配置）
+2. **定位问题**
+   - 打印 `ClassLoader.getResources("META-INF/services/...")` 看看实际找到了哪些 URL
+   - 检查打包后（fat jar/uber jar）是否正确**合并**了多个 `META-INF/services` 文件
+3. **性能**
+   - 解析配置文件很轻量、加载是惰性的
+   - 频繁新增/卸载 jar 时，记得 `sl.reload()` 触发重扫
+
+------
+
+## 9. 代码模板（实践范式）
+
+### 9.1 安全筛选 + 按需实例化
+
+```java
+ServiceLoader<MySPI> sl = ServiceLoader.load(MySPI.class);
+for (ServiceLoader.Provider<MySPI> p : sl.stream().toList()) {
+    Class<? extends MySPI> type = p.type();
+    if (!WHITELIST.contains(type.getName())) continue; // 白名单
+    MySPI impl = p.get(); // 需要时才实例化
+    // use impl
+}
+```
+
+------
+
+### 9.2 显式 ClassLoader（避免 TCCL 干扰）
+
+```java
+ClassLoader cl = MySPI.class.getClassLoader(); // 或受控的自定义 CL
+ServiceLoader<MySPI> sl = ServiceLoader.load(MySPI.class, cl);
+```
+
+------
+
+### 9.3 强制重扫（部署后热插拔）
+
+```java
+sl.reload(); // 清空 providers 缓存，重新解析 resources
+```
+
+------
+
+## 10. Java 9+ 模块系统（JPMS）补充
+
+- 在 `module-info.java` 中声明：
+
+```java
+module my.module {
+    uses com.example.MySPI;                      // 使用端
+    provides com.example.MySPI
+        with com.example.impl.MySPIImpl;         // 提供端
+}
+```
+
+- JPMS 环境下，SPI 解析也可以依赖 `uses/provides` 元数据（不止 `META-INF/services`）
+
+------
+
+### 11.一图速记（文字版）
+
+```java
+ServiceLoader.load(S) ──> new LazyIterator(S, CL)
+  iterator.hasNext()
+    └─ hasNextService():
+         - 构建 fullName = META-INF/services/<S>
+         - CL.getResources(fullName) => Enum<URL> configs
+         - while pending == null or !pending.hasNext():
+             - if !configs.hasMoreElements(): return false
+             - pending = parse(service, configs.nextElement()) // -> Iterator<String> of class names
+         - nextName = pending.next(); return true
+
+  iterator.next()
+    └─ nextService():
+         - cn = nextName; nextName = null
+         - Class.forName(cn, false, CL)  // 校验类型
+         - instance = c.newInstance()
+         - providers.put(cn, instance)
+         - return instance
+```
+
